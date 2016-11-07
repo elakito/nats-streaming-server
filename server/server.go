@@ -34,11 +34,9 @@ const (
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
-	DefaultPubPrefix      = "_STAN.pub"
-	DefaultSubPrefix      = "_STAN.sub"
-	DefaultUnSubPrefix    = "_STAN.unsub"
-	DefaultClosePrefix    = "_STAN.close"
-	DefaultStoreType      = stores.TypeMemory
+
+	// By default server uses a memory store.
+	DefaultStoreType = stores.TypeMemory
 
 	// Heartbeat intervals.
 	DefaultHeartBeatInterval   = 30 * time.Second
@@ -62,6 +60,19 @@ const (
 	// DefaultIOSleepTime is the duration (in micro-seconds) the server waits for more messages
 	// before starting processing. Set to 0 (or negative) to disable the wait.
 	DefaultIOSleepTime = int64(0)
+)
+
+const (
+	ackSubjToken   = "ack"
+	ackMarker      = 'a'
+	pubSubjToken   = "pub"
+	pubMarker      = 'p'
+	subSubjToken   = "sub"
+	subMarker      = 's'
+	unsubSubjToken = "unsub"
+	unsubMarker    = 'u'
+	closeSubjToken = "close"
+	closeMarker    = 'c'
 )
 
 // Constant to indicate that sendMsgToSub() should check number of acks pending
@@ -138,7 +149,7 @@ type StanServer struct {
 	sync.RWMutex
 	shutdown   bool
 	serverID   string
-	info       spb.ServerInfo // Contains cluster ID and subjects
+	info       spb.ServerInfo // Contains cluster ID
 	natsServer *server.Server
 	opts       *Options
 
@@ -170,9 +181,15 @@ type StanServer struct {
 	store stores.Store
 
 	// IO Channel
-	ioChannel     chan (*ioPendingMsg)
+	ioChannel     chan (*nats.Msg)
 	ioChannelQuit chan bool
 	ioChannelWG   sync.WaitGroup
+
+	// The root of all subjects (except for discovery): _STAN.<nuid>
+	rootSubj string
+	// The offet in a message subject that points after the "ack" token:
+	// _STAN.<nuid>.ack.
+	subIDOffset int
 
 	// Use these flags for Debug/Trace in places where speed matters.
 	// Normally, Debugf and Tracef will check an atomic variable to
@@ -191,7 +208,7 @@ type subStore struct {
 	psubs    []*subState            // plain subscribers
 	qsubs    map[string]*queueState // queue subscribers
 	durables map[string]*subState   // durables lookup
-	acks     map[string]*subState   // ack inbox lookup
+	acks     map[uint64]*subState   // lookup by subID for acks
 	stan     *StanServer            // back link to Stan server
 }
 
@@ -214,7 +231,6 @@ type subState struct {
 	ackWait      time.Duration // SubState.AckWaitInSecs expressed as a time.Duration
 	ackTimer     *time.Timer
 	ackTimeFloor int64
-	ackSub       *nats.Subscription
 	acksPending  map[uint64]struct{}
 	stalledRdlv  int32 // number of times the redelivery cb ended with a stalled subscriber (due to MaxInFlight)
 	stalled      bool
@@ -243,7 +259,7 @@ func (s *StanServer) createSubStore() *subStore {
 		psubs:    make([]*subState, 0, 4),
 		qsubs:    make(map[string]*queueState),
 		durables: make(map[string]*subState),
-		acks:     make(map[string]*subState),
+		acks:     make(map[uint64]*subState),
 		stan:     s,
 	}
 	return subs
@@ -275,8 +291,8 @@ func (ss *subStore) Store(sub *subState) error {
 // The subStore is locked on entry (or does not need, as during server restart).
 // However, `sub` does not need locking since it has just been created.
 func (ss *subStore) updateState(sub *subState) {
-	// First store by ackInbox for ack direct lookup
-	ss.acks[sub.AckInbox] = sub
+	// First store by subscription ID for ack direct lookup
+	ss.acks[sub.ID] = sub
 
 	// Store by type
 	if sub.isQueueSubscriber() {
@@ -335,11 +351,7 @@ func (ss *subStore) Remove(cs *stores.ChannelStore, sub *subState, unsubscribe b
 	}
 	// Clear the subscriptions clientID
 	sub.ClientID = ""
-	if sub.ackSub != nil {
-		sub.ackSub.Unsubscribe()
-		sub.ackSub = nil
-	}
-	ackInbox := sub.AckInbox
+	subID := sub.ID
 	qs := sub.qstate
 	isDurable := sub.IsDurable
 	subid := sub.ID
@@ -356,8 +368,8 @@ func (ss *subStore) Remove(cs *stores.ChannelStore, sub *subState, unsubscribe b
 	}
 
 	ss.Lock()
-	// Delete from ackInbox lookup.
-	delete(ss.acks, ackInbox)
+	// Delete from acks lookup.
+	delete(ss.acks, subID)
 
 	// Delete from durable if needed
 	if unsubscribe && durableKey != "" {
@@ -471,10 +483,10 @@ func (ss *subStore) LookupByDurable(durableName string) *subState {
 	return sub
 }
 
-// Lookup by ackInbox name.
-func (ss *subStore) LookupByAckInbox(ackInbox string) *subState {
+// Lookup by subscription ID in the acks map.
+func (ss *subStore) LookupByID(subID uint64) *subState {
 	ss.RLock()
-	sub := ss.acks[ackInbox]
+	sub := ss.acks[subID]
 	ss.RUnlock()
 	return sub
 }
@@ -737,6 +749,7 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) *StanServer 
 	// Create clientStore
 	s.clients = &clientStore{store: s.store}
 
+	genSubjAndInit := false
 	if recoveredState != nil {
 		// Copy content
 		s.info = *recoveredState.Info
@@ -749,23 +762,42 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) *StanServer 
 		// Restore clients state
 		s.processRecoveredClients(recoveredState.Clients)
 
+		// Check if we recovered subjects with the old format
+		if strings.HasPrefix(s.info.Publish, "_STAN.pub.") {
+			// If so, we can't start if there are recovered clients.
+			// Communication with them would be impossible.
+			if len(recoveredState.Clients) > 0 {
+				panic(fmt.Errorf("Cannot start this server version with recovered clients." +
+					" Restart with previous server version, ensure that all clients" +
+					" are stopped, then restart with the newer server version."))
+			}
+			genSubjAndInit = true
+		}
 		// Process recovered channels (if any).
 		recoveredSubs = s.processRecoveredChannels(recoveredState.Subs)
 	} else {
 		s.info.ClusterID = s.opts.ID
 		// Generate Subjects
-		// FIXME(dlc) guid needs to be shared in cluster mode
 		s.info.Discovery = fmt.Sprintf("%s.%s", s.opts.DiscoverPrefix, s.info.ClusterID)
-		s.info.Publish = fmt.Sprintf("%s.%s", DefaultPubPrefix, nuid.Next())
-		s.info.Subscribe = fmt.Sprintf("%s.%s", DefaultSubPrefix, nuid.Next())
-		s.info.Unsubscribe = fmt.Sprintf("%s.%s", DefaultUnSubPrefix, nuid.Next())
-		s.info.Close = fmt.Sprintf("%s.%s", DefaultClosePrefix, nuid.Next())
+		genSubjAndInit = true
+	}
+
+	if genSubjAndInit {
+		s.rootSubj = fmt.Sprintf("_STAN.%s", nuid.Next())
+		s.info.Publish = fmt.Sprintf("%s.%s", s.rootSubj, pubSubjToken)
+		s.info.Subscribe = fmt.Sprintf("%s.%s", s.rootSubj, subSubjToken)
+		s.info.Unsubscribe = fmt.Sprintf("%s.%s", s.rootSubj, unsubSubjToken)
+		s.info.Close = fmt.Sprintf("%s.%s", s.rootSubj, closeSubjToken)
 
 		// Initialize the store with the server info
 		if err := s.store.Init(&s.info); err != nil {
 			panic(fmt.Errorf("Unable to initialize the store: %v", err))
 		}
+	} else {
+		tokens := strings.Split(s.info.Publish, ".")
+		s.rootSubj = fmt.Sprintf("_STAN.%s", tokens[1])
 	}
+	s.subIDOffset = len(s.rootSubj) + 1 + len(ackSubjToken) + 1
 
 	// If no NATS server url is provided, it means that we embed the NATS Server
 	if sOpts.NATSServerURL == "" {
@@ -779,11 +811,8 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) *StanServer 
 	s.initSubscriptions()
 
 	if recoveredState != nil {
-		// Do some post recovery processing (create subs on AckInbox, setup
-		// some timers, etc...)
-		if err := s.postRecoveryProcessing(recoveredState.Clients, recoveredSubs); err != nil {
-			panic(fmt.Errorf("error during post recovery processing: %v\n", err))
-		}
+		// Do some post recovery processing (setup some timers, etc...)
+		s.postRecoveryProcessing(recoveredState.Clients)
 	}
 
 	// Flush to make sure all subscriptions are processed before
@@ -1077,23 +1106,7 @@ func (s *StanServer) processRecoveredChannels(subscriptions stores.RecoveredSubs
 
 // Do some final setup. Be minded of locking here since the server
 // has started communication with NATS server/clients.
-func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, recoveredSubs []*subState) error {
-	var err error
-	for _, sub := range recoveredSubs {
-		sub.Lock()
-		// To be on the safe side, just check that the ackSub has not
-		// been created (may happen with durables that may reconnect maybe?)
-		if sub.ackSub == nil {
-			// Subscribe to acks
-			sub.ackSub, err = s.nc.Subscribe(sub.AckInbox, s.processAckMsg)
-			if err != nil {
-				sub.Unlock()
-				return err
-			}
-			sub.ackSub.SetPendingLimits(-1, -1)
-		}
-		sub.Unlock()
-	}
+func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client) {
 	// Go through the list of clients and ensure their Hb timer is set.
 	for _, sc := range recoveredClients {
 		c := sc.UserData.(*client)
@@ -1110,7 +1123,6 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 		}
 		c.Unlock()
 	}
-	return nil
 }
 
 // Redelivers unacknowledged messages and release the hold for new messages delivery
@@ -1161,41 +1173,31 @@ func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
 // initSubscriptions will setup initial subscriptions for discovery etc.
 func (s *StanServer) initSubscriptions() {
 
-	s.startStoreIOWriter()
+	s.startIOLoop()
 
-	// Listen for connection requests.
-	_, err := s.nc.Subscribe(s.info.Discovery, s.connectCB)
+	// Listen for connection requests
+	sub, err := s.nc.Subscribe(s.info.Discovery, s.connectCB)
 	if err != nil {
 		panic(fmt.Sprintf("Could not subscribe to discover subject, %v\n", err))
 	}
-	// Receive published messages from clients.
+	sub.SetPendingLimits(-1, -1)
+
+	// Listen for all other protocols
+	sub, err = s.nc.Subscribe(fmt.Sprintf("%s.>", s.rootSubj), func(m *nats.Msg) {
+		s.ioChannel <- m
+	})
+	if err != nil {
+		panic(fmt.Sprintf("Could not subscribe to process incoming subject, %v\n", err))
+	}
+	sub.SetPendingLimits(-1, -1)
+
 	pubSubject := fmt.Sprintf("%s.>", s.info.Publish)
-	_, err = s.nc.Subscribe(pubSubject, s.processClientPublish)
-	if err != nil {
-		panic(fmt.Sprintf("Could not subscribe to publish subject, %v\n", err))
-	}
-	// Receive subscription requests from clients.
-	_, err = s.nc.Subscribe(s.info.Subscribe, s.processSubscriptionRequest)
-	if err != nil {
-		panic(fmt.Sprintf("Could not subscribe to subscribe request subject, %v\n", err))
-	}
-	// Receive unsubscribe requests from clients.
-	_, err = s.nc.Subscribe(s.info.Unsubscribe, s.processUnSubscribeRequest)
-	if err != nil {
-		panic(fmt.Sprintf("Could not subscribe to unsubscribe request subject, %v\n", err))
-	}
-	// Receive close requests from clients.
-	_, err = s.nc.Subscribe(s.info.Close, s.processCloseRequest)
-	if err != nil {
-		panic(fmt.Sprintf("Could not subscribe to close request subject, %v\n", err))
-	}
 
 	Debugf("STAN: Discover subject:    %s", s.info.Discovery)
 	Debugf("STAN: Publish subject:     %s", pubSubject)
 	Debugf("STAN: Subscribe subject:   %s", s.info.Subscribe)
 	Debugf("STAN: Unsubscribe subject: %s", s.info.Unsubscribe)
 	Debugf("STAN: Close subject:       %s", s.info.Close)
-
 }
 
 // Process a client connect request
@@ -1298,7 +1300,9 @@ func (s *StanServer) finishConnectRequest(sc *stores.Client, req *pb.ConnectRequ
 	client.hbt = time.AfterFunc(hbInterval, func() { s.checkClientHealth(clientID) })
 	client.Unlock()
 
-	Debugf("STAN: [Client:%s] Connected (Inbox=%v)", clientID, hbInbox)
+	if s.debug {
+		Debugf("STAN: [Client:%s] Connected (Inbox=%v)", clientID, hbInbox)
+	}
 }
 
 func (s *StanServer) processConnectRequestWithDupID(sc *stores.Client, req *pb.ConnectRequest, replyInbox string) {
@@ -1414,7 +1418,9 @@ func (s *StanServer) closeClient(clientID string) bool {
 	// Remove all non-durable subscribers.
 	s.removeAllNonDurableSubscribers(client)
 
-	Debugf("STAN: [Client:%s] Closed (Inbox=%v)", clientID, hbInbox)
+	if s.debug {
+		Debugf("STAN: [Client:%s] Closed (Inbox=%v)", clientID, hbInbox)
+	}
 	return true
 }
 
@@ -1447,21 +1453,26 @@ func (s *StanServer) sendCloseErr(subj, err string) {
 }
 
 // processClientPublish process inbound messages from clients.
-func (s *StanServer) processClientPublish(m *nats.Msg) {
+func (s *StanServer) processClientPublish(m *nats.Msg, storesToFlush map[*stores.ChannelStore]struct{}) *ioPendingMsg {
 	iopm := &ioPendingMsg{m: m}
 	pm := &iopm.pm
 	pm.Unmarshal(m.Data)
-
-	// TODO (cls) error check.
 
 	// Make sure we have a clientID, guid, etc.
 	if pm.Guid == "" || !s.clients.IsValid(pm.ClientID) || !isValidSubject(pm.Subject) {
 		Errorf("STAN: Received invalid client publish message %v", pm)
 		s.sendPublishErr(m.Reply, pm.Guid, ErrInvalidPubReq)
-		return
+		return nil
 	}
 
-	s.ioChannel <- iopm
+	cs, err := s.assignAndStore(&iopm.pm)
+	if err != nil {
+		Errorf("STAN: [Client:%s] Error processing message for subject %q: %v", iopm.pm.ClientID, iopm.m.Subject, err)
+		s.sendPublishErr(iopm.m.Reply, iopm.pm.Guid, err)
+		return nil
+	}
+	storesToFlush[cs] = struct{}{}
+	return iopm
 }
 
 func (s *StanServer) sendPublishErr(subj, guid string, err error) {
@@ -1835,13 +1846,13 @@ func (s *StanServer) setupAckTimer(sub *subState, d time.Duration) {
 	})
 }
 
-func (s *StanServer) startStoreIOWriter() {
+func (s *StanServer) startIOLoop() {
 	s.ioChannelWG.Add(1)
-	s.ioChannel = make(chan (*ioPendingMsg), ioChannelSize)
-	go s.storeIOLoop()
+	s.ioChannel = make(chan (*nats.Msg), ioChannelSize)
+	go s.ioLoop()
 }
 
-func (s *StanServer) storeIOLoop() {
+func (s *StanServer) ioLoop() {
 	defer s.ioChannelWG.Done()
 
 	////////////////////////////////////////////////////////////////////////////
@@ -1859,30 +1870,26 @@ func (s *StanServer) storeIOLoop() {
 	var _pendingMsgs [ioChannelSize]*ioPendingMsg
 	var pendingMsgs = _pendingMsgs[:0]
 
-	storeIOPendingMsg := func(iopm *ioPendingMsg) {
-		cs, err := s.assignAndStore(&iopm.pm)
-		if err != nil {
-			Errorf("STAN: [Client:%s] Error processing message for subject %q: %v", iopm.pm.ClientID, iopm.m.Subject, err)
-			s.sendPublishErr(iopm.m.Reply, iopm.pm.Guid, err)
-		} else {
-			pendingMsgs = append(pendingMsgs, iopm)
-			storesToFlush[cs] = struct{}{}
-		}
-	}
+	var _protoMsgs [ioChannelSize]*nats.Msg
+	var protoMsgs = _protoMsgs[:0]
 
 	batchSize := s.opts.IOBatchSize
 	sleepTime := s.opts.IOSleepTime
 	sleepDur := time.Duration(sleepTime) * time.Microsecond
 	max := 0
 
+	// Figure out the position where subjects diverge.
+	markerOffset := len(s.rootSubj) + 1
+
+	// Map used when processing PubMsg to know which store to flush
+	storesToFlush = make(map[*stores.ChannelStore]struct{})
+
 	for {
 		select {
-		case iopm := <-s.ioChannel:
-			// Create a new map (probably faster than deleting elements down below)
-			storesToFlush = make(map[*stores.ChannelStore]struct{})
+		case natsMsg := <-s.ioChannel:
 
-			// store the one we just pulled
-			storeIOPendingMsg(iopm)
+			// Add the one we just pulled
+			protoMsgs = append(protoMsgs, natsMsg)
 
 			remaining := batchSize - 1
 			// fill the pending messages slice with at most our batch size,
@@ -1910,7 +1917,7 @@ func (s *StanServer) storeIOLoop() {
 				}
 
 				for i := 0; i < ioChanLen; i++ {
-					storeIOPendingMsg(<-s.ioChannel)
+					protoMsgs = append(protoMsgs, <-s.ioChannel)
 				}
 				// Keep track of max number of messages in a batch
 				if ioChanLen > max {
@@ -1921,27 +1928,78 @@ func (s *StanServer) storeIOLoop() {
 				remaining -= ioChanLen
 			}
 
-			// flush all the stores with messages written to them...
-			for cs := range storesToFlush {
-				if err := cs.Msgs.Flush(); err != nil {
-					// TODO: Attempt recovery, notify publishers of error.
-					panic(fmt.Errorf("Unable to flush msg store: %v", err))
+			// Function that flushes stores and processes pub messages (sending
+			// to subs), and ack the publishers.
+			processPubMsg := func() {
+				// flush all the stores with messages written to them...
+				for cs := range storesToFlush {
+					if err := cs.Msgs.Flush(); err != nil {
+						// TODO: Attempt recovery, notify publishers of error.
+						panic(fmt.Errorf("Unable to flush msg store: %v", err))
+					}
+					// Call this here, so messages are sent to subscribers,
+					// which means that msg seq is added to subscription file
+					s.processMsg(cs)
+					if err := cs.Subs.Flush(); err != nil {
+						panic(fmt.Errorf("Unable to flush sub store: %v", err))
+					}
+
+					// It is safe to delete a key while iterating
+					delete(storesToFlush, cs)
 				}
-				// Call this here, so messages are sent to subscribers,
-				// which means that msg seq is added to subscription file
-				s.processMsg(cs)
-				if err := cs.Subs.Flush(); err != nil {
-					panic(fmt.Errorf("Unable to flush sub store: %v", err))
+
+				// Ack our messages back to the publisher
+				for i, iopm := range pendingMsgs {
+					s.ackPublisher(iopm)
+					pendingMsgs[i] = nil
 				}
+
+				// Clear out pending messages
+				pendingMsgs = pendingMsgs[:0]
 			}
 
-			// Ack our messages back to the publisher
-			for _, iopm := range pendingMsgs {
-				s.ackPublisher(iopm)
+			// Process the batch now
+			for i, m := range protoMsgs {
+				if markerOffset >= len(m.Subject) {
+					if s.debug {
+						Debugf("Invalid subject: %v", m.Subject)
+					}
+					protoMsgs[i] = nil
+					continue
+				}
+				marker := m.Subject[markerOffset]
+				if marker == pubMarker {
+					if iopm := s.processClientPublish(m, storesToFlush); iopm != nil {
+						pendingMsgs = append(pendingMsgs, iopm)
+					}
+				} else {
+					if len(pendingMsgs) > 0 {
+						processPubMsg()
+					}
+					switch marker {
+					case ackMarker:
+						s.processAckMsg(m)
+					case subMarker:
+						s.processSubscriptionRequest(m)
+					case unsubMarker:
+						s.processUnSubscribeRequest(m)
+					case closeMarker:
+						s.processCloseRequest(m)
+					default:
+						if s.debug {
+							Debugf("Invalid subject: %v", m.Subject)
+						}
+					}
+				}
+				protoMsgs[i] = nil
 			}
 
-			// clear out pending messages and store map
-			pendingMsgs = pendingMsgs[:0]
+			if len(pendingMsgs) > 0 {
+				processPubMsg()
+			}
+
+			// Clear out protocol messages
+			protoMsgs = protoMsgs[:0]
 
 		case <-s.ioChannelQuit:
 			return
@@ -2048,7 +2106,17 @@ func (s *StanServer) processUnSubscribeRequest(m *nats.Msg) {
 	// Get the subStore
 	ss := cs.UserData.(*subStore)
 
-	sub := ss.LookupByAckInbox(req.Inbox)
+	// We receive the "ackInbox" from the client in req.Inbox.
+	// The ackInbox is a subject that contains the subscription's
+	// ID as the last token. Extract it now.
+	subID := uint64(0)
+	// If invalid subject, lookup below will fail.
+	if len(req.Inbox) > s.subIDOffset {
+		subIDStr := req.Inbox[s.subIDOffset:]
+		subID, err = parseSubID(subIDStr)
+		// If error, subID will be 0 and lookup below will fail.
+	}
+	sub := ss.LookupByID(subID)
 	if sub == nil {
 		Errorf("STAN: [Client:%s] unsub request for missing inbox %s.",
 			req.ClientID, req.Inbox)
@@ -2066,7 +2134,9 @@ func (s *StanServer) processUnSubscribeRequest(m *nats.Msg) {
 	// Remove the subscription, force removal if durable.
 	ss.Remove(cs, sub, true)
 
-	Debugf("STAN: [Client:%s] Unsubscribing subject=%s.", req.ClientID, sub.subject)
+	if s.debug {
+		Debugf("STAN: [Client:%s] Unsubscribing subject=%s.", req.ClientID, sub.subject)
+	}
 
 	// Create a non-error response
 	resp := &pb.SubscriptionResponse{AckInbox: req.Inbox}
@@ -2233,8 +2303,8 @@ func (s *StanServer) updateDurable(ss *subStore, sub *subState) error {
 		// Add back into plain subscribers
 		ss.psubs = append(ss.psubs, sub)
 	}
-	// And in ackInbox lookup map.
-	ss.acks[sub.AckInbox] = sub
+	// And in acks lookup map.
+	ss.acks[sub.ID] = sub
 	ss.Unlock()
 
 	return nil
@@ -2287,8 +2357,6 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	ss := cs.UserData.(*subStore)
 
 	var sub *subState
-
-	ackInbox := nats.NewInbox()
 
 	// Will be true for durable queue subscribers and durable subscribers alike.
 	isDurable := false
@@ -2345,9 +2413,6 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	if sub != nil {
 		// ok we have a remembered subscription
 		sub.Lock()
-		// Set ClientID and new AckInbox but leave LastSent to the
-		// remembered value.
-		sub.AckInbox = ackInbox
 		sub.ClientID = sr.ClientID
 		sub.Inbox = sr.Inbox
 		sub.IsDurable = true
@@ -2393,7 +2458,6 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 				ClientID:      sr.ClientID,
 				QGroup:        sr.QGroup,
 				Inbox:         sr.Inbox,
-				AckInbox:      ackInbox,
 				MaxInFlight:   sr.MaxInFlight,
 				AckWaitInSecs: sr.AckWaitInSecs,
 				DurableName:   sr.DurableName,
@@ -2423,19 +2487,9 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	Debugf("STAN: [Client:%s] Added subscription on subject=%s, inbox=%s",
 		sr.ClientID, sr.Subject, sr.Inbox)
 
-	// In case this is a durable, sub already exists so we need to protect access
-	sub.Lock()
-	// Subscribe to acks
-	sub.ackSub, err = s.nc.Subscribe(ackInbox, s.processAckMsg)
-	if err != nil {
-		sub.Unlock()
-		panic(fmt.Sprintf("Could not subscribe to ack subject, %v\n", err))
-	}
-	sub.ackSub.SetPendingLimits(-1, -1)
-	sub.Unlock()
-
 	// Create a non-error response
-	resp := &pb.SubscriptionResponse{AckInbox: ackInbox}
+	ackSubject := fmt.Sprintf("%s.%s.%v", s.rootSubj, ackSubjToken, sub.ID)
+	resp := &pb.SubscriptionResponse{AckInbox: ackSubject}
 	b, _ := resp.Marshal()
 	s.ncs.Publish(m.Reply, b)
 
@@ -2463,10 +2517,43 @@ func (s *StanServer) processAckMsg(m *nats.Msg) {
 	ack.Unmarshal(m.Data)
 	cs := s.store.LookupChannel(ack.Subject)
 	if cs == nil {
-		Errorf("STAN: [Client:?] Ack received, invalid channel (%s)", ack.Subject)
+		Errorf("STAN: Ack received, invalid channel (%s)", ack.Subject)
 		return
 	}
-	s.processAck(cs, cs.UserData.(*subStore).LookupByAckInbox(m.Subject), ack.Sequence)
+	var sub *subState
+	if len(m.Subject) > s.subIDOffset {
+		subIDStr := m.Subject[s.subIDOffset:]
+		subID, _ := parseSubID(subIDStr)
+		sub = cs.UserData.(*subStore).LookupByID(subID)
+	}
+	if sub == nil {
+		Errorf("STAN: Ack received, invalid subscription ID: %v", m.Subject)
+		return
+	}
+	s.processAck(cs, sub, ack.Sequence)
+}
+
+// Ascii numbers 0-9
+const (
+	ascii0 = 48
+	ascii9 = 57
+)
+
+// parseSubID returns the subscription ID as an uint64 from the given string
+// or an error.
+func parseSubID(subID string) (uint64, error) {
+	if len(subID) == 0 {
+		return 0, fmt.Errorf("0 length string")
+	}
+	n := uint64(0)
+	for i := 0; i < len(subID); i++ {
+		dec := subID[i]
+		if dec < ascii0 || dec > ascii9 {
+			return 0, fmt.Errorf("Invalid string")
+		}
+		n = n*10 + (uint64(dec) - ascii0)
+	}
+	return n, nil
 }
 
 // processAck processes an ack and if needed sends more messages.

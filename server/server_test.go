@@ -1698,10 +1698,6 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 	subs := s.clients.GetSubs(clientName)
 	durable := subs[0]
 	durable.RLock()
-	// Get the AckInbox.
-	ackInbox := durable.AckInbox
-	// Get the ack subscriber
-	ackSub := durable.ackSub
 	durable.RUnlock()
 
 	// Send a message
@@ -1710,7 +1706,7 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 	}
 
 	// Verify message is acked.
-	checkDurableNoPendingAck(t, s, true, ackInbox, ackSub, 1)
+	checkDurableNoPendingAck(t, s, 1)
 
 	// Close stan connection
 	sc.Close()
@@ -1732,8 +1728,8 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 		t.Fatalf("Unexpected error on publish: %v", err)
 	}
 
-	// Verify that we have different AckInbox and ackSub and message is acked.
-	checkDurableNoPendingAck(t, s, false, ackInbox, ackSub, 2)
+	// Verify that message is acked.
+	checkDurableNoPendingAck(t, s, 2)
 
 	// Close stan connection
 	sc.Close()
@@ -1750,8 +1746,8 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 	// Check durable is found
 	checkDurable(t, s, "foo", durName, durKey)
 
-	// Verify that we have different AckInbox and ackSub and message is acked.
-	checkDurableNoPendingAck(t, s, false, ackInbox, ackSub, 2)
+	// Verify that message is acked.
+	checkDurableNoPendingAck(t, s, 2)
 
 	numMsgs := len(msgs)
 	if numMsgs > 2 {
@@ -1812,31 +1808,10 @@ func TestDurableRemovedOnUnsubscribe(t *testing.T) {
 	}
 }
 
-func checkDurableNoPendingAck(t *testing.T, s *StanServer, isSame bool,
-	ackInbox string, ackSub *nats.Subscription, expectedSeq uint64) {
+func checkDurableNoPendingAck(t *testing.T, s *StanServer, expectedSeq uint64) {
 	// When called, we know that there is 1 sub, and the sub is a durable.
 	subs := s.clients.GetSubs(clientName)
 	durable := subs[0]
-	durable.RLock()
-	durAckInbox := durable.AckInbox
-	durAckSub := durable.ackSub
-	durable.RUnlock()
-
-	if isSame {
-		if durAckInbox != ackInbox {
-			stackFatalf(t, "Expected ackInbox %v, got %v", ackInbox, durAckInbox)
-		}
-		if durAckSub != ackSub {
-			stackFatalf(t, "Expected subscriber on ack to be %p, got %p", ackSub, durAckSub)
-		}
-	} else {
-		if durAckInbox == ackInbox {
-			stackFatalf(t, "Expected different ackInbox'es")
-		}
-		if durAckSub == ackSub {
-			stackFatalf(t, "Expected different ackSub")
-		}
-	}
 
 	limit := time.Now().Add(5 * time.Second)
 	for time.Now().Before(limit) {
