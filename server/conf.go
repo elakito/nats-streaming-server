@@ -46,6 +46,8 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				opts.StoreType = stores.TypeFile
 			case stores.TypeMemory:
 				opts.StoreType = stores.TypeMemory
+			case stores.TypeHybrid:
+				opts.StoreType = stores.TypeHybrid
 			default:
 				return fmt.Errorf("Unknown store type: %v", v.(string))
 			}

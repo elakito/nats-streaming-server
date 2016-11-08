@@ -16,6 +16,8 @@ const (
 	TypeMemory = "MEMORY"
 	// TypeFile is the store type name for file based stores
 	TypeFile = "FILE"
+	// TypeHybrid is the store type name for hybrid stores
+	TypeHybrid = "HYBRID"
 )
 
 const (

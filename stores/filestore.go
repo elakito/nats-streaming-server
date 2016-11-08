@@ -334,7 +334,8 @@ type FileMsgStore struct {
 	currSliceIdx int
 	slCountLim   int
 	slSizeLim    uint64
-	fstore       *FileStore // pointers to file store object
+	opts         *FileStoreOptions // points to options from FileStore
+	crcTable     *crc32.Table
 	cache        bool       // shortcut to fstore.opts.CacheMsgs
 	msgs         map[uint64]*msgRecord
 	wOffset      int64
@@ -1063,11 +1064,12 @@ func (fs *FileStore) newFileMsgStore(channelDirName, channel string, doRecover b
 
 	// Create an instance and initialize
 	ms := &FileMsgStore{
-		fstore:       fs,
 		msgs:         make(map[uint64]*msgRecord, 64),
 		wOffset:      int64(4), // The very first record starts after the file version record
 		bufferedMsgs: make([]uint64, 0, 1),
 		cache:        fs.opts.CacheMsgs,
+		opts:         &fs.opts,
+		crcTable:     fs.crcTable,
 	}
 	// Defaults to the global limits
 	msgStoreLimits := fs.limits.MsgStoreLimits
@@ -1258,8 +1260,8 @@ func (ms *FileMsgStore) recoverOneMsgFile(useIdxFile bool, numFile int) (bool, e
 		}
 	} else {
 		// Get these from the file store object
-		crcTable := ms.fstore.crcTable
-		doCRC := ms.fstore.opts.DoCRC
+		crcTable := ms.crcTable
+		doCRC := ms.opts.DoCRC
 		cache := ms.cache
 
 		// We are going to write the index file while recovering the data file
@@ -1369,7 +1371,7 @@ func (ms *FileMsgStore) addIndex(buf []byte, seq uint64, offset, timestamp int64
 	util.ByteOrder.PutUint64(buf[8:], uint64(offset))
 	util.ByteOrder.PutUint64(buf[16:], uint64(timestamp))
 	util.ByteOrder.PutUint32(buf[24:], uint32(msgSize))
-	crc := crc32.Checksum(buf[:msgIndexRecSize-crcSize], ms.fstore.crcTable)
+	crc := crc32.Checksum(buf[:msgIndexRecSize-crcSize], ms.crcTable)
 	util.ByteOrder.PutUint32(buf[msgIndexRecSize-crcSize:], crc)
 }
 
@@ -1386,9 +1388,9 @@ func (ms *FileMsgStore) readIndex(r io.Reader) (uint64, *msgRecord, error) {
 	mrec.offset = int64(util.ByteOrder.Uint64(buf[8:]))
 	mrec.timestamp = int64(util.ByteOrder.Uint64(buf[16:]))
 	mrec.msgSize = util.ByteOrder.Uint32(buf[24:])
-	if ms.fstore.opts.DoCRC {
+	if ms.opts.DoCRC {
 		storedCRC := util.ByteOrder.Uint32(buf[msgIndexRecSize-crcSize:])
-		crc := crc32.Checksum(buf[:msgIndexRecSize-crcSize], ms.fstore.crcTable)
+		crc := crc32.Checksum(buf[:msgIndexRecSize-crcSize], ms.crcTable)
 		if storedCRC != crc {
 			return 0, nil, fmt.Errorf("corrupted data, expected crc to be 0x%08x, got 0x%08x", storedCRC, crc)
 		}
@@ -1464,7 +1466,7 @@ func (ms *FileMsgStore) Store(data []byte) (uint64, error) {
 			bwBuf = ms.bw.buf
 		}
 	}
-	ms.tmpMsgBuf, recSize, err = writeRecord(ms.writer, ms.tmpMsgBuf, recNoType, m, msgSize, ms.fstore.crcTable)
+	ms.tmpMsgBuf, recSize, err = writeRecord(ms.writer, ms.tmpMsgBuf, recNoType, m, msgSize, ms.crcTable)
 	if err != nil {
 		return 0, err
 	}
@@ -1792,7 +1794,7 @@ func (ms *FileMsgStore) lookup(seq uint64) *pb.MsgProto {
 			if _, err := file.Seek(m.offset, 0); err != nil {
 				return nil
 			}
-			ms.tmpMsgBuf, msgSize, _, err = readRecord(file, ms.tmpMsgBuf, false, ms.fstore.crcTable, ms.fstore.opts.DoCRC)
+			ms.tmpMsgBuf, msgSize, _, err = readRecord(file, ms.tmpMsgBuf, false, ms.crcTable, ms.opts.DoCRC)
 			if err != nil {
 				return nil
 			}
@@ -1912,7 +1914,7 @@ func (ms *FileMsgStore) flush() error {
 			return err
 		}
 	}
-	if ms.fstore.opts.DoSync {
+	if ms.opts.DoSync {
 		if err := ms.file.Sync(); err != nil {
 			return err
 		}
