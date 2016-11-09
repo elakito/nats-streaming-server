@@ -733,7 +733,8 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) *StanServer 
 			err = fmt.Errorf("for %v stores, root directory must be specified", stores.TypeHybrid)
 			break
 		}
-		s.store, recoveredState, err = stores.NewHybridStore(sOpts.FilestoreDir, limits)
+		s.store, recoveredState, err = stores.NewHybridStore(sOpts.FilestoreDir, limits,
+			stores.AllOptions(&sOpts.FileStoreOpts))
 	default:
 		err = fmt.Errorf("unsupported store type: %v", sOpts.StoreType)
 	}

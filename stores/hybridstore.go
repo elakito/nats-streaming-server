@@ -274,6 +274,22 @@ func (ms *HybridStore) newHybridMemMsgStore(channelDirName, channel string, doRe
 	if err != nil {
 		return nil, err
 	}
+
+	// in order to guard against a panic when the storage type is switched to file, create dummy .dat and .idx files
+	// REVISIT as this code is not needed if filestore takes care of this situation.
+	dummyFName := filepath.Join(channelDirName, "msgs.1.dat")
+	dummyFile, err := openFile(dummyFName)
+	if err != nil {
+		return nil, err
+	}
+	dummyFile.Close()
+	dummyFName = filepath.Join(channelDirName, "msgs.1.idx")
+	dummyFile, err = openFile(dummyFName)
+	if err != nil {
+		return nil, err
+	}
+	dummyFile.Close()
+
 	if doRecover {
 		if err := mms.recoverSequence(); err != nil {
 			mms.Close()
@@ -445,12 +461,51 @@ func (ms *HybridMemMsgStore) Store(data []byte) (uint64, error) {
 
 	return ms.last, nil
 }
+// Close implements the MsgStore interface
+// modified from MemoryStore.Close
+func (ms *HybridMemMsgStore) Close() error {
+	ms.Lock()
+	if ms.closed {
+		ms.Unlock()
+		return nil
+	}
+	ms.closed = true
+	if ms.ageTimer != nil {
+		if ms.ageTimer.Stop() {
+			ms.wg.Done()
+		}
+	}
+	err := ms.flush()
+	if cerr := ms.seqFile.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	ms.Unlock()
+
+	ms.wg.Wait()
+	return err
+}
+
+func (ms *HybridMemMsgStore) flush() error {
+	if err := ms.seqFile.Sync(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Flush flushes outstanding sequence info into the store.
+func (ms *HybridMemMsgStore) Flush() error {
+	ms.Lock()
+	err := ms.flush()
+	ms.Unlock()
+	return err
+}
 
 // recoverSequence recovers the sequence status for this store.
 func (ms *HybridMemMsgStore) recoverSequence() error {
 	buf := make([]byte, 8)
 	if _, err := ms.seqFile.ReadAt(buf, 4); err != nil {
-		return err
+		// assume the sequence file is empty or corrupted, hence use the default sequence info
+		return nil
 	}
 	ms.last = util.ByteOrder.Uint64(buf)
 	ms.first = ms.last + 1
