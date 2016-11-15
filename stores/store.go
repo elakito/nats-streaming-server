@@ -64,6 +64,9 @@ type MsgStoreLimits struct {
 	MaxBytes int64
 	// How long messages are kept in the log (unit is seconds)
 	MaxAge time.Duration
+	// StoreAutoDelete allows MsgStore objects to be deleted after all messages have been deleted during
+	// message expiration procssing (0 for no delete, 1 for delete if no subscribers, 2 for delete always)
+	StoreAutoDelete int
 }
 
 // SubStoreLimits defines limits for a SubStore
@@ -158,6 +161,10 @@ type Store interface {
 
 	// HasChannel returns true if this store has any channel.
 	HasChannel() bool
+
+	// DeleteChannel deletes the ChannelStore for the given channel unless there are subscribers or unconditionally
+	// if 'force' is true.
+	DeleteChannel(channel string, force bool)
 
 	// MsgsState returns message store statistics for a given channel, or all
 	// if 'channel' is AllChannels.

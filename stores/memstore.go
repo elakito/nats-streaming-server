@@ -67,6 +67,7 @@ func (ms *MemoryStore) CreateChannel(channel string, userData interface{}) (*Cha
 	}
 
 	msgStore := &MemoryMsgStore{msgs: make(map[uint64]*pb.MsgProto, 64)}
+	msgStore.store = ms
 	msgStore.init(channel, &msgStoreLimits)
 
 	subStore := &MemorySubStore{}
@@ -81,6 +82,21 @@ func (ms *MemoryStore) CreateChannel(channel string, userData interface{}) (*Cha
 	ms.channels[channel] = channelStore
 
 	return channelStore, true, nil
+}
+
+// DeleteChannel deletes the ChannelStore for the given channel.
+func (ms *MemoryStore) DeleteChannel(channel string, force bool) {
+	ms.Lock()
+	defer ms.Unlock()
+	cs := ms.channels[channel]
+	if cs != nil {
+		if force || cs.Subs.(*MemorySubStore).subsCount == 0 {
+			cs.Msgs.Close()
+			cs.Subs.Close()
+			delete(ms.channels, channel)
+		}
+	}
+	return
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -188,6 +204,9 @@ func (ms *MemoryMsgStore) expireMsgs() {
 		if !ok {
 			ms.ageTimer = nil
 			ms.wg.Done()
+			if ms.limits.StoreAutoDelete != 0 {
+				go ms.store.DeleteChannel(ms.subject, ms.limits.StoreAutoDelete > 1)
+			}
 			return
 		}
 		diff := now - m.Timestamp

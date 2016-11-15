@@ -873,6 +873,23 @@ func (fs *FileStore) CreateChannel(channel string, userData interface{}) (*Chann
 	return channelStore, true, nil
 }
 
+func (fs *FileStore) DeleteChannel(channel string, force bool) {
+	fs.Lock()
+	defer fs.Unlock()
+
+	cs := fs.channels[channel]
+	if cs != nil {
+		if force || cs.Subs.(*FileSubStore).subsCount == 0 {
+			cs.Msgs.Close()
+			cs.Subs.Close()
+			delete(fs.channels, channel)
+			channelDirName := filepath.Join(fs.rootDir, channel)
+			os.RemoveAll(channelDirName)
+		}
+	}
+	return
+}
+
 // AddClient stores information about the client identified by `clientID`.
 func (fs *FileStore) AddClient(clientID, hbInbox string, userData interface{}) (*Client, bool, error) {
 	sc, isNew, err := fs.genericStore.AddClient(clientID, hbInbox, userData)
@@ -1069,6 +1086,7 @@ func (fs *FileStore) newFileMsgStore(channelDirName, channel string, doRecover b
 		bufferedMsgs: make([]uint64, 0, 1),
 		cache:        fs.opts.CacheMsgs,
 	}
+	ms.store = fs
 	// Defaults to the global limits
 	msgStoreLimits := fs.limits.MsgStoreLimits
 	// See if there is an override
@@ -1576,6 +1594,9 @@ func (ms *FileMsgStore) expireMsgs() {
 		if !ok {
 			ms.ageTimer = nil
 			ms.allDone.Done()
+			if ms.limits.StoreAutoDelete != 0 {
+				go ms.store.DeleteChannel(ms.subject, ms.limits.StoreAutoDelete > 1)
+			}
 			return
 		}
 		diff := now - m.timestamp

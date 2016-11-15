@@ -686,6 +686,43 @@ func testFlush(t *testing.T, s Store) {
 	}
 }
 
+func testAutoDeleteChannel(t *testing.T, s Store, force bool) {
+	sl := testDefaultStoreLimits
+	sl.MaxAge = 250 * time.Millisecond
+	if force {
+		sl.StoreAutoDelete = 2
+	} else {
+		sl.StoreAutoDelete = 1
+	}
+	s.SetLimits(&sl)
+
+	msg := []byte("hello")
+	storeMsg(t, s, "foo", msg)
+	storeMsg(t, s, "bar", msg)
+	storeSub(t, s, "foo")
+
+	// Wait for expiration
+	time.Sleep(300 * time.Millisecond)
+
+	if force {
+		// we should find no channel
+		if s.LookupChannel("foo") != nil {
+			t.Fatal("Unexpected channel foo")
+		}
+		if s.LookupChannel("bar") != nil {
+			t.Fatal("Unexpected channel bar")
+		}
+	} else {
+		// we should find foo but no bar
+		if s.LookupChannel("foo") == nil {
+			t.Fatal("Expected channel foo")
+		}
+		if s.LookupChannel("bar") != nil {
+			t.Fatal("Unexpected channel bar")
+		}
+	}
+}
+
 func TestGSNoOps(t *testing.T) {
 	gs := &genericStore{}
 	defer gs.Close()

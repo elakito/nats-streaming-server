@@ -3365,3 +3365,24 @@ func TestFSPerChannelLimits(t *testing.T) {
 
 	testPerChannelLimits(t, fs)
 }
+
+func TestFSAutoDeleteChannel(t *testing.T) {
+	cleanupDatastore(t, defaultDataStore)
+	defer cleanupDatastore(t, defaultDataStore)
+
+	fs := createDefaultFileStore(t)
+	defer fs.Close()
+
+	testAutoDeleteChannel(t, fs, false)
+}
+
+func TestFSAutoDeleteChannelForced(t *testing.T) {
+	cleanupDatastore(t, defaultDataStore)
+	defer cleanupDatastore(t, defaultDataStore)
+
+	fs := createDefaultFileStore(t)
+	defer fs.Close()
+
+	testAutoDeleteChannel(t, fs, true)
+}
+

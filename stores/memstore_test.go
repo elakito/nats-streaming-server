@@ -202,3 +202,18 @@ func TestMSPerChannelLimits(t *testing.T) {
 
 	testPerChannelLimits(t, ms)
 }
+
+func TestMSAutoDeleteChannel(t *testing.T) {
+	ms := createDefaultMemStore(t)
+	defer ms.Close()
+
+	testAutoDeleteChannel(t, ms, false)
+}
+
+func TestMSAutoDeleteChannelForced(t *testing.T) {
+	ms := createDefaultMemStore(t)
+	defer ms.Close()
+
+	testAutoDeleteChannel(t, ms, true)
+}
+

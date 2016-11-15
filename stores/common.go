@@ -45,6 +45,7 @@ type genericSubStore struct {
 type genericMsgStore struct {
 	commonStore
 	limits     MsgStoreLimits
+	store      Store
 	subject    string // Can't be wildcard
 	first      uint64
 	last       uint64
@@ -127,6 +128,12 @@ func (gs *genericStore) HasChannel() bool {
 	l := len(gs.channels)
 	gs.RUnlock()
 	return l > 0
+}
+
+// DeleteChannel deletes the ChannelStore for the given channel.
+func (gs *genericStore) DeleteChannel(channel string) {
+	// no-op as CreateChannel is no-op
+	return
 }
 
 // State returns message store statistics for a given channel ('*' for all)

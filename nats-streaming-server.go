@@ -31,6 +31,8 @@ Streaming Server Options:
     -ma,  --max_age <seconds>        Max duration a message can be stored ("0s" for unlimited)
     -ns,  --nats_server <url>        Connect to this external NATS Server (embedded otherwise)
     -sc,  --stan_config <file>       Streaming server configuration file
+    --store_auto_delete              Enable deletion of store if all messages are expired
+                                     (0 for no deletion, 1 for if no subscribes, 2 for always)
 
 Streaming Server File Store Options:
     --file_compact_enabled           Enable file compaction
@@ -148,6 +150,7 @@ func parseFlags() (*stand.Options, *natsd.Options) {
 	flag.Int64("mb", stores.DefaultStoreLimits.MaxBytes, "MaxBytes")
 	flag.String("max_age", "0s", "MaxAge")
 	flag.String("ma", "0s", "MaxAge")
+	flag.Int("store_auto_delete", 0, "StoreAutoDelete")
 	flag.Bool("SD", false, "Debug")
 	flag.Bool("stan_debug", false, "Debug")
 	flag.Bool("SV", false, "Trace")

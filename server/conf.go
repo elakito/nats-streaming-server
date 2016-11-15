@@ -185,6 +185,11 @@ func parseChannelLimits(cl *stores.ChannelLimits, k, name string, v interface{})
 			return err
 		}
 		cl.MaxAge = dur
+	case "store_auto_delete":
+		if err := checkType(k, reflect.Int, v); err != nil {
+			return err
+		}
+		cl.StoreAutoDelete = v.(int)
 	}
 	return nil
 }
